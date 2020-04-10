@@ -124,7 +124,7 @@ g3 <- ggplot(data = ovr, aes(x = Layer1, y = Layer2, fill = time, color = time))
 
 ov <- ov[ov$time == '68h',]
 
-# Computing residuals of regression again RNA for RNA and ATAC (Note : resid() is removing rows with NA if na.action is not specified)
+# Computing residuals of regression again RNA for H3K4me3 and ATAC (Note : resid() is removing rows with NA if na.action is not specified)
 
 ov$residuals_K4 <- resid(lm(meanprop_k4 ~ meanprop_RNA , na.action=na.exclude, data = ov))
 ov$fitK4 <- predict(lm(meanprop_k4 ~ meanprop_RNA , na.action=na.exclude, data = ov))
