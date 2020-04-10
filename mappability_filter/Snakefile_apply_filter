@@ -1,0 +1,99 @@
+# Snakefile     : Intersect bam files with filter
+# Use           : 1. intersect bam files with filter
+# Input         : bam files and bed filters (from Snakefiles in Create_filters folder)
+# Output        : bam files
+# Run with      : bsub -o log/SNK.txt -N snakemake --cluster 'bsub {params.cluster}' --jobs x -s Snake -p
+
+# Wildcard containing the targetted lines
+DGRP = "028 057 307 399 639 712 714 852".split()
+DATA =   "ATAC"
+TIMEP = "24 68 1012".split()
+REP = "1 2".split()
+
+#This are the rule you want to be run  locally and not submitted to the cluster.
+localrules:all
+
+#These variables will store paths to scripts you want to use, note that it still uses java genomic toolkit and STAR from David's folder
+python_bin = "/g/furlong/project/36_cisRegVar/src/python/tools"
+sh_bin = "/g/furlong/project/36_cisRegVar/src/sh"
+
+#Set the input of the all rule as the final files. This will be the default running "objective" of snakemake
+rule all:
+    input:
+        expand("universal/bam_files/vgn{dgrp}_{timep}h_rep{rep}_{datatype}.merged.filtered.csort.bam", dgrp = DGRP, timep = TIMEP, datatype = DATA, rep = REP),
+        expand("line_specific/bam_files/vgn{dgrp}_{timep}h_rep{rep}_{datatype}.merged.filtered.csort.bam", dgrp = DGRP, timep = TIMEP, datatype = DATA, rep = REP),
+
+# Step 1 : intersect bam files with filter
+rule do_intersect_uni_filter:
+    input:
+        bam = "Store_BAM_Files/vgn{dgrp}_{timep}h_rep{rep}_{datatype}.merged.sorted.bam",
+        bed = "Store_BED_Filters/universal_atac_filter.bed"
+    output:
+        temp("universal/bam_files/vgn{dgrp}_{timep}h_rep{rep}_{datatype}.merged.filtered.bam")
+    params:
+        bin = python_bin,
+        site = "universal"
+    message:
+        "intersecting the merged bams with the mappability filters! In folder {params.site}"
+    shell:
+        "mkdir -p {params.site}/bam_files ;\
+        python2.7 {params.bin}/intersect_bam.py -i {input.bam} -b {input.bed} -o {output}"
+
+
+rule do_intersect_LS_filter:
+    input:
+        bam = "Store_BAM_Files/vgn{dgrp}_{timep}h_rep{rep}_{datatype}.merged.sorted.bam",
+        bed = "Store_BED_Filters/{dgrp}_atac_filter.bed"
+    output:
+        temp("line_specific/bam_files/vgn{dgrp}_{timep}h_rep{rep}_{datatype}.merged.filtered.bam")
+    params:
+        bin = python_bin,
+        site = "line_specific"
+    message:
+        "intersecting the merged bams with the mappability filters! In folder {params.site}"
+    shell:
+        "mkdir -p {params.site}/bam_files ;\
+        python2.7 {params.bin}/intersect_bam.py -i {input.bam} -b {input.bed} -o {output}"
+
+
+rule do_coord_sort:
+    input:
+        "{dir}/bam_files/{dgrp}.bam"
+    output:
+        "{dir}/bam_files/{dgrp}.csort.bam"
+    params:
+        pfx = "{dir}/bam_files/{dgrp}.csort",
+        site = "{dir}"
+    message:
+        "Sorting {input} in {params.site}"
+    shell:
+        "/g/furlong/garfield/bin/samtools sort {input} {params.pfx}"
+
+
+rule do_index_csort:
+    input:
+        "{dir}/bam_files/{dgrp}.csort.bam"
+    output:
+        "{dir}/bam_files/{dgrp}.csort.bam.bai"
+    message:
+        "Indexing {input}"
+    shell:
+        "/g/furlong/garfield/bin/samtools index {input}"
+
+
+# Step final : add the cluster parameters when undefined in rule
+name='cluster'
+for r in workflow.rules:
+    #default = '-o ./log/'+str(r)+'.log -M 5000 -R "select[(mem > 5000)]"'
+    default = '--mem-per-cpu=5000 -p 1day -o ./log/'+str(r)
+    try:
+        getattr(r.params, name)
+    except AttributeError:
+        r.params.append(default)
+        r.params.add_name(name)
+
+# Creates log folder
+shell('mkdir -p log')
+shell.prefix("ls > /dev/null ; sleep 60; ")
+
+# Et voilà :)

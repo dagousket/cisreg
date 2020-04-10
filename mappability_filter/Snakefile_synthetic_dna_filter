@@ -1,0 +1,303 @@
+# Snakefile     : Syntetic filter
+# Use           : 1. create synthetic reads
+#                 2. map them to themselves
+#                 3. liftover to dm3
+#                 4. get coverage
+#                 5. extract regions where coverage between dgrp and vgn is unequal
+# Input         : gff, fasta and chain file dgrp
+#                 virginizer psl.gz file (from Snakefile_synthetic_vgn)
+# Output        : bed files
+# Run with      : bsub -o log/SNK.txt -N snakemake --cluster 'bsub {params.cluster}' --jobs x -s Snake -p
+
+# Wildcard containing the targetted lines
+DGRP = "028 057 307 399 639 712 714 852 virginizer".split()
+
+#This are the rule you want to be run  locally and not submitted to the cluster.
+localrules:all
+
+#These variables will store paths to scripts you want to use, note that it still uses java genomic toolkit and STAR from David's folder
+python_bin = "/g/furlong/project/36_cisRegVar/src/python/tools"
+sh_bin = "/g/furlong/project/36_cisRegVar/src/sh"
+
+#Set the input of the all rule as the final files. This will be the default running "objective" of snakemake
+rule all:
+    input:
+        expand("synthetic_dna/filters/{dgrp}_vs_vgn_differences.bb", dgrp = DGRP)
+        
+# Step 0 : Set required files/folder
+
+rule do_generate_bwa_indices_DGRP:
+    input:
+        fasta = "/g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/DGRP/DGRP-{dgrp}/DGRP-{dgrp}.final.fa",
+    output:
+        "indices/{dgrp}/{dgrp}.bwt"
+    params:
+        cluster = '-o log/DGRP_bwa_index.cluster.out -R "span[hosts=1]"',
+        bwa_path='/g/furlong/garfield/software/bwa/bwa-0.7.12/bwa',
+        pfx = "indices/{dgrp}/{dgrp}",
+        fold = "indices/{dgrp}"
+    message:
+        "Creating indeces for DGRP"
+    shell:
+        "mkdir -p {params.fold} ; \
+        {params.bwa_path} index -p {params.pfx} {input.fasta}"
+
+
+# Step 1 : create synthetic reads
+
+rule do_generate_synthetic_reads_dgrp:
+    input:
+        fasta = "/g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/DGRP/DGRP-{dgrp}/DGRP-{dgrp}.final.fa"
+    output:
+        "dna_reads/{dgrp}.fastq.gz"
+    params:
+        line = "{dgrp}",
+        bin = python_bin
+    message:
+        "Generates synthetic genome from fasta of a DGRP line"
+    shell:
+        "mkdir -p dna_reads/ ; \
+        {params.bin}/fragment_genome.py -i {input.fasta} -o {output} --fastq -f 75 -r"
+
+
+# Step 2 : map them to themselves
+
+rule do_run_bwa_atac:
+    input:
+        inRead = "dna_reads/{sample}.fastq.gz",
+        index = "indices/{sample}/{sample}.bwt"
+    output:
+        temp("synthetic_dna/bam_files/{sample}.bwa.sai")
+    threads: 6 #adjust cluster threads if changed
+    params:
+        cluster = '-n 6 -o synthetic_dna_100bp/bam_files/log/{sample}_mp{sample}_Log.cluster.out -R "span[hosts=1]" -M 5000 -R "select[(mem > 5000)]"',
+        bwa_path='/g/furlong/garfield/software/bwa/bwa-0.7.12/bwa',
+        ALIGNMENT_PARAMS='-n 6 ',
+        pfx = "indices/{sample}/{sample}"
+    message:
+        "Mapping genomic reads with BWA, step 1"
+    shell:
+        "mkdir -p synthetic_dna/bam_files/log ;\
+        {params.bwa_path} aln {params.ALIGNMENT_PARAMS} -t {threads} {params.pfx} {input.inRead} > {output};"
+
+
+rule do_bwa_samse:
+    input:
+        read1 = "{dir}/bam_files/{sample}.bwa.sai",
+        fastq1 = "dna_reads/{sample}.fastq.gz",
+        index = "indices/{sample}/{sample}.bwt"
+    output:
+        "{dir}/bam_files/{sample}_mp{sample}.bam"
+    params:
+        pfx = "indices/{sample}/{sample}",
+        bwa_path='/g/furlong/garfield/software/bwa/bwa-0.7.12/bwa'
+    message:
+        "Mapping genomic reads with BWA, step 2"
+    shell:
+        "{params.bwa_path} samse {params.pfx} {input.read1} {input.fastq1} | samtools view -bS - > {output}"
+
+
+rule do_name_sort:
+    input:
+        "{dir}/bam_files/{dgrp}_mp{dgrp}.bam"
+    output:
+        temp("{dir}/bam_files/{dgrp}_mp{dgrp}.nsort.bam")
+    params:
+        pfx = "{dir}/bam_files/{dgrp}_mp{dgrp}.nsort"
+    message:
+        "Sorting {input}"
+    shell:
+        "samtools sort -n {input} {params.pfx}"
+
+
+rule do_quality_filter:
+    input:
+        "{dir}/bam_files/{dgrp}_mp{dgrp}.nsort.bam"
+    output:
+        "{dir}/bam_files/{dgrp}_mp{dgrp}.nsort.filt.bam"
+    params:
+        min_read_qual="-rq 20",
+        min_base_qual="-bq 18",
+        bin = python_bin
+    message:
+        "Filter the poor quality reads from {input}"
+    shell:
+        "{params.bin}/filter_bam_map_qual.py -i {input} -o {output} {params.min_read_qual} {params.min_base_qual} -m --primary_alignment"
+
+
+# Step 3 : liftover to dm3
+
+rule do_psl_liftover:
+    input:
+        "{dir}/bam_files/{dgrp}_mp{dgrp}.nsort.filt.bam"
+    output:
+        temp("{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.psl.gz")
+    params:
+        loc = "{dir}",
+        chain = "/g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/DGRP/DGRP-{dgrp}/DGRP-{dgrp}.final.chain",
+        bin = python_bin
+    message:
+        "Lift over coordinates to dm3 and convert {input} to PSL format"
+    shell:
+        "mkdir -p {params.loc}/psl_files ; {params.bin}/bam_to_psl.py -i {input} -o stdout |\
+         pslMap -chainMapFile stdin {params.chain} stdout |\
+         gzip -c > {output}"
+
+
+# Step 4 : get coverage (fast)
+
+rule do_psl_to_bed:
+    input:
+        "{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.psl.gz"
+    output:
+        temp("{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.bed12")
+    message:
+        "PSL to Bed12"
+    shell:
+        "zcat {input} | /g/furlong1/garfield/bin/pslToBed stdin {output}"
+
+
+rule do_bed_to_bedgraph:
+    input:
+        "{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.bed12"
+    output:
+        temp("{dir}/bam_files/{dgrp}_mp{dgrp}.ondm3.bg")
+    message:
+        "Bed12 to BedGraph, with bash sort command"
+    shell:
+        "cat {input} | sort -k1,1 -k2,2n | bedtools genomecov -bga -split -i stdin -g /g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/dm3/dm3.fa.fai > {output}"
+
+
+rule do_BedGraph_to_BigWig:
+    input:
+        "{dir}/bam_files/{dgrp}_mp{dgrp}.ondm3.bg"
+    output:
+        "{dir}/bw_files/{dgrp}_mp{dgrp}.ondm3.bw"
+    params:
+        loc = "{dir}"
+    message:
+        "Converting {input} into BigWig"
+    shell:
+        "mkdir -p {params.loc}/bw_files ;\
+         bedGraphToBigWig {input} /g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/dm3/dm3.fa.fai {output}"
+
+
+# Alternative Step 4 : get coverage (slow)
+#
+# rule do_translate_coordinates:
+#     input:
+#         bam = "{dir}/bam_files/{dgrp}_mp{dgrp}.nsort.filt.bam",
+#         psl = "{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.psl.gz"
+#     output:
+#         "{dir}/bam_files/{dgrp}_mp{dgrp}.ondm3.bam"
+#     params:
+#         chrom_size = "/g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/dm3/dm3.fa.fai",
+#         bin = python_bin
+#     message:
+#         "Translating the coordinates of the bam file to dm3"
+#     shell:
+#         "{params.bin}/translate_bam_coordinates.py -i {input.bam} -p {input.psl} -o {output} -c {params.chrom_size}"
+#
+#
+# rule do_bam_to_bedgraph:
+#     input:
+#         "{dir}/bam_files/{dgrp}_mp{dgrp}.ondm3.bam"
+#     output:
+#         temp("{dir}/bam_files/{dgrp}_mp{dgrp}.ondm3.bg")
+#     message:
+#         "Converting {input} into BedGraph"
+#     shell:
+#         "bamToBed -bed12 -i {input} | sort -k 1,1 -k 2,2n | bedtools genomecov -split -bga -i stdin -g /g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/dm3/dm3.fa.fai > {output}"
+
+
+# Step 6 : extract regions where coverage between dgrp and vgn is unequal
+
+rule do_substract_reads:
+    input:
+        dgrp = "{dir}/bw_files/{dgrp}_mp{dgrp}.ondm3.bw",
+        vgn = "{dir}/bw_files/virginizer_mpvirginizer.ondm3.bw"
+    output:
+        temp("{dir}/filters/{dgrp}_subvirginizer.w")
+    params:
+        loc = "{dir}"
+    message:
+        "Substracting two BigWigs to create {output}"
+    shell:
+        "mkdir -p {params.loc}/filters ;\
+         /g/furlong/garfield/software/java_genomics_toolkit/toolRunner.sh wigmath.Subtract -m {input.vgn} -s {input.dgrp} -o {output}"
+
+
+rule do_absolute_wig:
+    input:
+        "{dir}/filters/{dgrp}_subvirginizer.w"
+    output:
+        temp("{dir}/filters/{dgrp}_subvirginizer.abs.w")
+    params:
+        bin = python_bin
+    message:
+        "Converting {input} to absolute values"
+    shell:
+        "/g/furlong/flochlay/cisReg/src/python/tools/absolute_wig.py -f {input} -o {output}"
+
+
+rule do_Wig_to_BigWig:
+    input:
+        "{dir}/filters/{file}.w"
+    output:
+        "{dir}/filters/{file}.bw"
+    message:
+        "Converting {input} to BigWig"
+    shell:
+        "wigToBigWig {input} /g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/dm3/dm3.fa.fai {output}"
+
+
+rule do_filter_dif_map_region:
+    input:
+        "{dir}/filters/{dgrp}_subvirginizer.abs.bw"
+    output:
+        temp("{dir}/filters/{dgrp}_vs_vgn_differences.bed")
+    message:
+        "Converting {input} to into Bed file of all differentially mappable regions"
+    shell:
+        "bigWigToBedGraph {input} stdout | awk '$4 != 0' | sort -k1,1 -k2,2n | bedtools merge -i stdin > {output}"
+
+
+rule do_filter_good_region:
+    input:
+        "{dir}/filters/{dgrp}_vs_vgn_differences.bed"
+    output:
+        temp("{dir}/filters/{dgrp}_vs_vgn_good_regions.bed")
+    params:
+        chrsize = "/g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/dm3/chr_sizes_dm3.bed"
+    message:
+        "Getting good regions (equivalent mapping)"
+    shell:
+        "bedtools subtract -a {params.chrsize} -b {input} >  {output}"
+
+
+rule do_Bed_to_BigBed:
+    input:
+        "{dir}/filters/{file}.bed"
+    output:
+        "{dir}/filters/{file}.bb"
+    message:
+        "Converting {input} into BigBed"
+    shell:
+        "bedToBigBed {input} /g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/dm3/dm3.fa.fai {output}"
+
+
+# Step final : add the cluster parameters when undefined in rule
+name='cluster'
+for r in workflow.rules:
+    default = '-o ./log/'+str(r)+'.log -M 5000 -R "select[(mem > 5000)]"'
+    try:
+        getattr(r.params, name)
+    except AttributeError:
+        r.params.append(default)
+        r.params.add_name(name)
+
+# Creates log folder
+shell('mkdir -p log')
+shell.prefix("ls > /dev/null ; sleep 60; ")
+
+# Et voilà :)

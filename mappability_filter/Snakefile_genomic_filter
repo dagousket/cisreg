@@ -1,0 +1,221 @@
+# Snakefile     : Genomic filter
+# Use           : 1. map genomic reads from dgrp lines on themselves (STAR)
+#                 2. liftover to dm3
+#                 3. get coverage files
+#                 4. extract region with null coverage
+# Input         : fastq, gff, fasta and chain file dgrp
+#                 virginizer psl.gz file (from Snakefile_genomic_vgn)
+# Output        : bed files
+# Run with      : bsub -o log/SNK.txt -N snakemake --cluster 'bsub {params.cluster}' --jobs x -s Snake -p
+
+# Wildcard containing the targetted lines
+DGRP = "028 057 307 399 639 712 714 852 virginizer".split()
+
+localrules:all
+
+# Path of the scripts from project folder to use
+python_bin = "/g/furlong/project/36_cisRegVar/src/python/tools"
+sh_bin = "/g/furlong/project/36_cisRegVar/src/sh"
+
+rule all:
+    input:
+        expand("genomic/psl_files/{dgrp}_mp{dgrp}.ondm3.bw", dgrp = DGRP)
+        expand("genomic/filters/{dgrp}_mappable_region.ondm3.bb", dgrp = DGRP),
+        expand("genomic/filters/{dgrp}_bad_region.ondm3.bb", dgrp = DGRP)
+
+
+# Step 0 : set up required files/folders
+
+rule do_generate_star_indices_dgrp:
+    input:
+        fasta = "/g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/DGRP/DGRP-{dgrp}/DGRP-{dgrp}.final.fa",
+        gff = "/g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/DGRP/DGRP-{dgrp}/dm5.57_mp{dgrp}.sort.cmp.merged.gff"
+    output:
+        "indices/{dgrp}/transcriptInfo.tab"
+    params:
+        cluster = '-n 20 -M 10000 -R "select[(mem > 10000)]" -o log/DGRP_index.cluster.out -R "span[hosts=1]"',
+        index = "indices/{dgrp}/"
+    message:
+        "Creating indeces for DGRP"
+    shell:
+        "mkdir -p {params.index} ; \
+        /g/furlong1/garfield/bin/STAR --runThreadN 20 --runMode genomeGenerate --genomeDir {output} --genomeFastaFiles {input.fasta} \
+        --sjdbGTFfile {input.gff} --sjdbGTFtagExonParentTranscript Parent -—sjdbOverhang 99"
+
+
+# Step 1 : map genomic reads from dgrp lines on themselves (STAR)
+
+rule do_trimfq:
+    input:
+        "genomic_reads/{dgrp}.fastq.gz"
+    output:
+        "genomic_reads/{dgrp}.trim.fastq.gz"
+    message:
+        "Trim the genomic reads"
+    shell:
+        "seqtk trimfq {input} | gzip -c > {output}"
+
+
+rule do_run_STAR_genomic:
+    input:
+        fastq = "genomic_reads/{dgrp}.trim.fastq.gz",
+        indeces = "indices/{dgrp}/"
+    output:
+        "genomic/bam_files/{dgrp}_mp{dgrp}.bam"
+    params:
+        cluster = '-n 20 -o genomic/bam_files/log/{dgrp}_mp{dgrp}_Log.cluster.out -R "span[hosts=1]" -M 5000 -R "select[(mem > 5000)]"',
+        prefix = "genomic/bam_files/{dgrp}_mp{dgrp}_",
+        clipping = "--alignEndsType Local", #Alternative is EndToEnd, but Local probably makes more sense, though perhaps we should check this?
+    message:
+        "Mapping genomic reads with STAR to create {output}"
+    shell:
+        "mkdir -p genomic/bam_files/log ;\
+         /g/furlong/flochlay/software/STAR/bin/Linux_x86_64/STAR --runThreadN 20 --genomeDir {input.indeces} \
+         --readFilesCommand zcat --readFilesIn {input.fastq} --outSAMunmapped Within --outSAMtype BAM Unsorted \
+         {params.clipping} --alignSJoverhangMin 8 --alignSJDBoverhangMin 1 --outFileNamePrefix {params.prefix} ;\
+         rename '_Aligned.out' '' {params.prefix}*bam ; mv {params.prefix}Log* {params.prefix}SJ* genomic/bam_files/log"
+
+
+rule do_name_sort:
+    input:
+        "{dir}/bam_files/{dgrp}_mp{dgrp}.bam"
+    output:
+        temp("{dir}/bam_files/{dgrp}_mp{dgrp}.nsort.bam")
+    params:
+        pfx = "{dir}/bam_files/{dgrp}_mp{dgrp}.nsort"
+    message:
+        "Sorting {input}"
+    shell:
+        "/g/furlong/garfield/bin/samtools sort -n {input} {params.pfx}"
+
+
+rule do_quality_filter:
+    input:
+        "{dir}/bam_files/{dgrp}_mp{dgrp}.nsort.bam"
+    output:
+        temp("{dir}/bam_files/{dgrp}_mp{dgrp}.nsort.filt.bam")
+    params:
+        min_read_qual="-rq 20",
+        min_base_qual="-bq 18",
+        bin = python_bin
+    message:
+        "Filter the poor quality reads from {input}"
+    shell:
+        "{params.bin}/filter_bam_map_qual.py -i {input} -o {output} {params.min_read_qual} {params.min_base_qual} -m --primary_alignment"
+
+
+# Step 2 : liftover to dm3
+
+rule do_psl_liftover:
+    input:
+        "{dir}/bam_files/{dgrp}_mp{dgrp}.nsort.filt.bam"
+    output:
+        temp("{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.psl.gz")
+    params:
+        chain = "/g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/DGRP/DGRP-{dgrp}/DGRP-{dgrp}.chain",
+        bin = python_bin
+    message:
+        "Lift over coordinates to dm3 and convert {input} to PSL format"
+    shell:
+        "mkdir -p genomic/psl_files ; {params.bin}/bam_to_psl.py -i {input} -o stdout |\
+         pslMap -chainMapFile stdin {params.chain} stdout |\
+         gzip -c > {output}"
+
+
+# Step 3 : get coverage files
+
+rule do_psl_to_bed:
+    input:
+        "{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.psl.gz"
+    output:
+        temp("{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.bed12")
+    message:
+        "PSL to Bed12"
+    shell:
+        "zcat {input} | /g/furlong1/garfield/bin/pslToBed stdin {output}"
+
+
+rule do_bed_to_bedgraph:
+    input:
+        "{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.bed12"
+    output:
+        temp("{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.bg")
+    message:
+        "Bed12 to BedGraph, with bash sort command"
+    shell:
+        "cat {input} | sort -k1,1 -k2,2n | bedtools genomecov -bga -split -i stdin -g /g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/dm3/dm3.fa.fai > {output}"
+
+
+rule do_bedgraph_to_bigwig:
+    input:
+        "{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.bg"
+    output:
+        "{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.bw"
+    message:
+        "BedGraph to BigWig"
+    shell:
+        "bedGraphToBigWig {input} /g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/dm3/dm3.fa.fai {output}"
+
+
+# Step 4 : extract region with null coverage
+
+rule do_bigwig_to_wig:
+    input:
+        "{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.bw"
+    output:
+        temp("{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.w")
+    message:
+        "BigWig to Wig"
+    shell:
+        "bigWigToWig {input} {output}"
+
+
+rule do_filter_mappable_region:
+    input:
+        "{dir}/psl_files/{dgrp}_mp{dgrp}.ondm3.w"
+    output:
+        temp("{dir}/filters/{dgrp}_mappable_region.ondm3.bed")
+    message:
+        "Converting {input} to into Bed file of all mappable regions"
+    shell:
+        "mkdir -p genomic/filters ; cat {input} | grep -v '^#' | awk '$4 != 0'  | sort -k1,1 -k2,2n | bedtools merge -i stdin > {output}"
+
+
+rule do_filter_bad_region:
+    input:
+        "{dir}/filters/{dgrp}_mappable_region.ondm3.bed"
+    output:
+        temp("{dir}/filters/{dgrp}_bad_region.ondm3.bed")
+    params:
+        chrsize = "/scratch/flochlay/annotations/Dmel_ucsc_dm3.chrom.sizes.txt"
+    message:
+        "Getting bad regions"
+    shell:
+        "bedtools subtract -a {params.chrsize} -b {input} >  {output}"
+
+
+rule do_Bed_to_BigBed:
+    input:
+        "{dir}/filters/{file}.bed"
+    output:
+        "{dir}/filters/{file}.bb"
+    message:
+        "Converting {input} into BigBed"
+    shell:
+        "bedToBigBed {input} /g/furlong/project/36_cisRegVar/analysis/annotations/genotypes/dm3/dm3.fa.fai {output}"
+
+
+# Step final : add the cluster parameters when undefined in rule
+name='cluster'
+for r in workflow.rules:
+    default = '-o ./log/'+str(r)+'.log -M 5000 -R "select[(mem > 5000)]"'
+    try:
+        getattr(r.params, name)
+    except AttributeError:
+        r.params.append(default)
+        r.params.add_name(name)
+
+# Creates log folder
+shell('mkdir -p log')
+
+# Et voilà :)
