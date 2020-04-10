@@ -1,7 +1,7 @@
 # mapping_toolkit
 
 This repository contains scripts to help process genomic coordinates files (BED, GFF).
-It also include the script used to create the region overleap assignement for four non-coding layers (ATAC, RNA, ChIP).
+It also include the script used to create the region overlap assignement for four non-coding layers (ATAC, RNA, ChIP).
 
 ## gff_to_bed.py 
 
